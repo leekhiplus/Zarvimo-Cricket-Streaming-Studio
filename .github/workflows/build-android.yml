@@ -23,22 +23,59 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      # Finds the Gradle project even if the files were uploaded inside a sub-folder (e.g. the ZIP's top folder).
-      # Fails early with a clear message and a listing of the repository if no Gradle project exists at all.
+      # Finds the Gradle project automatically:
+      #   1. a real project in the repo (settings.gradle(.kts) next to an app/ module), in any sub-folder; or
+      #   2. if the repo only holds a ZIP (GitHub does NOT unpack ZIPs on upload), the ZIP is extracted here and used.
+      # Stray flat files (settings.gradle.kts without an app/ folder beside it) are ignored.
       - name: Locate Gradle project
         id: locate
+        shell: bash
         run: |
-          f=$(find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path './.git/*' | head -n 1)
-          if [ -z "$f" ]; then
-            echo "::error::No settings.gradle(.kts) found in this repository. Upload the CONTENTS of the project (app/, settings.gradle.kts, build.gradle.kts, gradle/, ...) to the repository."
+          find_project() {
+            local root="$1" f d
+            while IFS= read -r f; do
+              d=$(dirname "$f")
+              if [ -f "$d/app/build.gradle.kts" ] || [ -f "$d/app/build.gradle" ]; then
+                echo "$d"
+                return 0
+              fi
+            done < <(find "$root" -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/.git/*' | sort)
+            return 1
+          }
+
+          dir=""
+          if dir=$(find_project .); then
+            echo "Found a Gradle project in the repository: $dir"
+          else
+            echo "No ready Gradle project in the repository. Looking for a ZIP to extract..."
+            out="$GITHUB_WORKSPACE/_zarvimo_extracted"
+            rm -rf "$out"
+            mkdir -p "$out"
+            i=0
+            while IFS= read -r z; do
+              i=$((i + 1))
+              echo "Extracting: $z"
+              mkdir -p "$out/$i"
+              unzip -q -o "$z" -d "$out/$i" || { echo "Could not unzip $z"; continue; }
+              if dir=$(find_project "$out/$i"); then
+                echo "Found a Gradle project inside the ZIP: $dir"
+                break
+              fi
+              dir=""
+            done < <(find . -maxdepth 3 -iname '*.zip' -not -path '*/.git/*' | sort)
+          fi
+
+          if [ -z "$dir" ]; then
+            echo "::error::No Gradle project found. Keep the project ZIP in the repository root, or upload the project WITH its folders (app/, settings.gradle.kts, build.gradle.kts, gradle/ ...)."
             echo "Repository files (first 120):"
             find . -maxdepth 3 -not -path './.git/*' | sort | head -n 120
             exit 1
           fi
-          dir=$(dirname "$f")
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "Gradle project directory: $dir"
-          ls -la "$dir"
+
+          rel=$(realpath --relative-to="$GITHUB_WORKSPACE" "$dir")
+          echo "dir=$rel" >> "$GITHUB_OUTPUT"
+          echo "Gradle project directory: $rel"
+          ls -la "$rel"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -81,7 +118,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload debug APK
-        if: success() && hashFiles(format('{0}/app/build/outputs/apk/debug/app-debug.apk', steps.locate.outputs.dir)) != ''
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Zarvimo-Live-Cricket-Studio-debug-apk
