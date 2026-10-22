@@ -1,0 +1,210 @@
+# Save this file in your repository as:  .github/workflows/build-release.yml
+#
+# What it does on every push (and on "Run workflow" in the Actions tab):
+#   1. Finds the project: either the .zip you uploaded (it unzips it itself) or already-extracted files.
+#   2. Builds the debug APK with Gradle 8.11.1 / JDK 17.
+#   3. Runs the unit tests (informational: a failing test does not block the release).
+#   4. Publishes the APK under  Releases  (tag v<versionName>-build<run number>).
+
+name: Build APK and publish Release
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# "write" is required so the workflow can create the Release.
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    name: Build APK and publish Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate the project (zip or extracted files)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Shallowest settings.gradle(.kts) under a directory.
+          find_settings() {
+            find "$1" -maxdepth 5 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              -not -path '*/.git/*' -not -path '*/__MACOSX/*' \
+              | awk -F/ '{ print NF " " $0 }' | sort -n | sed -n 1p | cut -d' ' -f2-
+          }
+
+          # Newest-committed .zip in the repository that contains a Gradle project.
+          find_project_zip() {
+            local best="" best_ts=0 z names ts
+            while IFS= read -r -d '' z; do
+              names="$(unzip -Z1 "$z" 2>/dev/null || true)"
+              if grep -Eq '(^|/)settings\.gradle(\.kts)?$' <<<"$names"; then
+                ts="$(git log -1 --format=%ct -- "$z" 2>/dev/null || true)"
+                ts="${ts:-0}"
+                if [ -z "$best" ] || [ "$ts" -gt "$best_ts" ]; then best="$z"; best_ts="$ts"; fi
+              fi
+            done < <(find . -type f -iname '*.zip' -not -path './.git/*' -print0)
+            printf '%s' "$best"
+          }
+
+          SETTINGS="$(find_settings .)"
+          if [ -n "$SETTINGS" ]; then
+            PROJECT_DIR="$(cd "$(dirname "$SETTINGS")" && pwd)"
+            echo "Using project files found in the repository: $PROJECT_DIR"
+          else
+            ZIP="$(find_project_zip)"
+            if [ -z "$ZIP" ]; then
+              echo "::error::No Gradle project found. Upload the project .zip (it must contain settings.gradle.kts) to the repository, then push again."
+              exit 1
+            fi
+            echo "Unzipping: $ZIP"
+            rm -rf "$RUNNER_TEMP/zproject"
+            mkdir -p "$RUNNER_TEMP/zproject"
+            unzip -q -o "$ZIP" -d "$RUNNER_TEMP/zproject"
+            SETTINGS="$(find_settings "$RUNNER_TEMP/zproject")"
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::The zip was extracted but contains no settings.gradle(.kts)."
+              exit 1
+            fi
+            PROJECT_DIR="$(cd "$(dirname "$SETTINGS")" && pwd)"
+            echo "Using project from zip: $PROJECT_DIR"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Installs the pinned Gradle version, so no gradle-wrapper.jar is needed in the project.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      # The APK is built first and must succeed; the release is only published if it does.
+      - name: Build debug APK
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      # Informational: these tests have never been run before, so a failure here is reported but does not
+      # stop the release. Delete the "continue-on-error" line to make failing tests block the release.
+      - name: Run unit tests
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Summarize test results
+        id: summary
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, os
+          import xml.etree.ElementTree as ET
+
+          pd = os.environ.get("PROJECT_DIR", ".")
+          total = failed = skipped = 0
+          for f in glob.glob(os.path.join(pd, "app/build/test-results/testDebugUnitTest/*.xml")):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              total += int(root.get("tests", 0))
+              failed += int(root.get("failures", 0)) + int(root.get("errors", 0))
+              skipped += int(root.get("skipped", 0))
+
+          if total:
+              text = f"{total - failed - skipped} passed, {failed} failed, {skipped} skipped (of {total})"
+          else:
+              text = "not available (the tests did not run or did not compile)"
+
+          print("Unit tests:", text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### Unit tests\n{text}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write(f"text={text}\n")
+          PY
+
+      - name: Upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+          TEST_RESULT: ${{ steps.summary.outputs.text }}
+        run: |
+          set -euo pipefail
+
+          APK="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | sed -n 1p)"
+          if [ -z "$APK" ]; then
+            echo "::error::The debug APK was not produced."
+            exit 1
+          fi
+
+          VERSION="$(grep -hoE 'versionName *= *"[^"]+"' "$PROJECT_DIR"/app/build.gradle* 2>/dev/null \
+            | sed -n '1s/.*"\([^"]*\)".*/\1/p' || true)"
+          VERSION="${VERSION:-0.0.0}"
+          TAG="v${VERSION}-build${RUN_NUMBER}"
+          NAME="Zarvimo-Live-Cricket-Studio-v${VERSION}-build${RUN_NUMBER}-debug.apk"
+
+          mkdir -p dist
+          cp "$APK" "dist/$NAME"
+
+          cat > dist/notes.md <<EOF
+          **Zarvimo Live Cricket Studio** v${VERSION}, build ${RUN_NUMBER}
+
+          Download \`${NAME}\` below and install it on an Android phone (allow "install unknown apps" if asked).
+
+          - Debug-signed work-in-progress build. All builds share one signing key, so a newer APK installs over an older one.
+          - Commit: ${COMMIT_SHA}
+          - Unit tests: ${TEST_RESULT:-unknown}
+          EOF
+
+          # A re-run of the same run number replaces its own release instead of failing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --cleanup-tag --yes
+          fi
+
+          gh release create "$TAG" "dist/$NAME" \
+            --target "$COMMIT_SHA" \
+            --title "Zarvimo Live Cricket Studio v${VERSION} (build ${RUN_NUMBER})" \
+            --notes-file dist/notes.md \
+            --latest
+
+          URL="$(gh release view "$TAG" --json url --jq .url)"
+          echo "Release published: $URL"
+          echo "### Release published" >> "$GITHUB_STEP_SUMMARY"
+          echo "$URL" >> "$GITHUB_STEP_SUMMARY"
