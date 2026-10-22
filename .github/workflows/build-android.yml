@@ -23,15 +23,31 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      # Finds the Gradle project even if the files were uploaded inside a sub-folder (e.g. the ZIP's top folder).
+      # Fails early with a clear message and a listing of the repository if no Gradle project exists at all.
+      - name: Locate Gradle project
+        id: locate
+        run: |
+          f=$(find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path './.git/*' | head -n 1)
+          if [ -z "$f" ]; then
+            echo "::error::No settings.gradle(.kts) found in this repository. Upload the CONTENTS of the project (app/, settings.gradle.kts, build.gradle.kts, gradle/, ...) to the repository."
+            echo "Repository files (first 120):"
+            find . -maxdepth 3 -not -path './.git/*' | sort | head -n 120
+            exit 1
+          fi
+          dir=$(dirname "$f")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Gradle project directory: $dir"
+          ls -la "$dir"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      # The ubuntu-24.04 runner already ships the Android SDK (ANDROID_HOME). We deliberately do NOT use
-      # android-actions/setup-android: its default package list ("tools") no longer exists and made the job fail
-      # before Gradle ran. Accepting the licences lets AGP download any missing platform / build-tools itself.
+      # The ubuntu runner already ships the Android SDK (ANDROID_HOME). Accepting the licences lets AGP download
+      # any missing platform / build-tools itself.
       - name: Accept Android SDK licences
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
@@ -43,29 +59,32 @@ jobs:
 
       # Any failing step stops the job (GitHub runs `bash -e`), so a failed Gradle run can never report success.
       - name: Run unit tests
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
 
       - name: Assemble debug APK
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Verify the APK exists
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: |
           ls -l app/build/outputs/apk/debug/
           test -f app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload unit test reports
-        if: always()
+        if: always() && steps.locate.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: unit-test-reports
-          path: app/build/reports/tests/testDebugUnitTest/
+          path: ${{ steps.locate.outputs.dir }}/app/build/reports/tests/testDebugUnitTest/
           if-no-files-found: ignore
 
       - name: Upload debug APK
-        if: success() && hashFiles('app/build/outputs/apk/debug/app-debug.apk') != ''
+        if: success() && hashFiles(format('{0}/app/build/outputs/apk/debug/app-debug.apk', steps.locate.outputs.dir)) != ''
         uses: actions/upload-artifact@v4
         with:
           name: Zarvimo-Live-Cricket-Studio-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
